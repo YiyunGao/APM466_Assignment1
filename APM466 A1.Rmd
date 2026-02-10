@@ -1,0 +1,530 @@
+---
+title: "APM466 – Assignment 1"
+author: "Yiyun Gao (1009127071)"
+output:
+  html_document:
+    df_print: paged
+  pdf_document:
+    number_sections: false
+fontsize: 11pt
+geometry: margin=1in
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+library(tidyverse)
+library(lubridate)
+library(stringr)
+curves_raw <- readr::read_csv("Curves_raw.csv", show_col_types = FALSE)
+
+curves <- curves_raw %>%
+  mutate(
+    Date     = ymd(Date),
+    Maturity = ymd(Maturity),
+    Coupon   = as.numeric(Coupon),
+    YTM      = as.numeric(YTM)
+  ) %>%
+  arrange(Date, T_years)
+prices <- read.csv("Prices_10bonds.csv", check.names = FALSE, stringsAsFactors = FALSE)
+pct_to_dec <- function(x){
+  x <- as.character(x)
+  x <- str_replace_all(x, "\\s+", "")
+  x <- str_replace(x, "%", "")
+  as.numeric(x)/100
+}
+
+mdy_safe <- function(x) mdy(x)
+```
+
+```{r}
+F <- 100
+coupon_schedule <- function(settle, maturity){
+  d <- maturity
+  out <- c()
+  while(d > settle){
+    out <- c(out, d)
+    d <- d %m-% months(6)
+  }
+  sort(out)
+}
+
+last_coupon_date <- function(settle, maturity){
+  d <- maturity
+  while(d > settle){
+    d <- d %m-% months(6)
+  }
+  d
+}
+
+accrued_interest <- function(coupon_rate, settle, maturity, F = 100){
+  last <- last_coupon_date(settle, maturity)
+  next <- last %m+% months(6)
+  days_since  <- as.numeric(settle - last)
+  days_period <- as.numeric(next - last)
+  coupon_pay  <- coupon_rate * F / 2
+  coupon_pay * (days_since / days_period)
+}
+
+yearfrac_365 <- function(settle, d){
+  as.numeric(d - settle) / 365
+}
+
+df_interp_loglinear <- function(t, nodes){
+  tt <- nodes$time
+  ll <- log(nodes$df)
+  exp(approx(tt, ll, xout = t, rule = 2)$y)
+}
+bootstrap_discount_nodes <- function(settle, bond_day){
+  bd <- bond_day %>%
+    mutate(
+      tM    = yearfrac_365(settle, maturity),
+      dirty = clean + mapply(accrued_interest, coupon, MoreArgs = list(settle = settle, maturity = maturity, F = F))
+    ) %>%
+    arrange(tM)
+
+  nodes <- tibble(time = numeric(0), df = numeric(0))
+
+  for(i in seq_len(nrow(bd))){
+    cpn <- bd$coupon[i]
+    mat <- bd$maturity[i]
+    P   <- bd$dirty[i]
+
+    c_dates <- coupon_schedule(settle, mat)
+    times   <- map_dbl(c_dates, ~yearfrac_365(settle, .x))
+    tM      <- last(times)
+
+    C  <- F * cpn/2
+    cfs <- rep(C, length(times))
+    cfs[length(cfs)] <- cfs[length(cfs)] + F
+    price_given_dfM <- function(dfM){
+      total <- 0
+
+      if(nrow(nodes) == 0){
+        lM <- log(dfM)
+        for(k in seq_along(times)){
+          tk <- times[k]
+          if(tk < tM){
+            dfk <- exp((tk/tM)*lM)
+            total <- total + cfs[k]*dfk
+          } else {
+            total <- total + cfs[k]*dfM
+          }
+        }
+        return(total)
+      }
+
+      t_last  <- max(nodes$time)
+      df_last <- nodes$df[which.max(nodes$time)]
+
+      for(k in seq_along(times)){
+        tk <- times[k]
+        if(tk < tM){
+          if(tk <= t_last){
+            dfk <- df_interp_loglinear(tk, nodes)
+          } else {
+            w <- (tk - t_last) / (tM - t_last)
+            dfk <- exp((1-w)*log(df_last) + w*log(dfM))
+          }
+          total <- total + cfs[k]*dfk
+        } else {
+          total <- total + cfs[k]*dfM
+        }
+      }
+      total
+    }
+
+    f <- function(dfM) price_given_dfM(dfM) - P
+    lo <- 1e-8
+    hi <- 2
+    flo <- f(lo); fhi <- f(hi)
+    it <- 0
+    while(flo*fhi > 0 && it < 60){
+      hi <- hi*2
+      fhi <- f(hi)
+      it <- it + 1
+    }
+    if(flo*fhi > 0){
+      stop("Failed to bracket DF root on ", as.character(settle), " for bond ", bd$ISIN[i])
+    }
+
+    dfM <- uniroot(f, lower = lo, upper = hi, tol = 1e-12)$root
+    nodes <- bind_rows(nodes, tibble(time = tM, df = dfM)) %>% arrange(time)
+  }
+
+  nodes
+}
+spot_at_years <- function(nodes, years = 1:5){
+  dfs <- map_dbl(years, ~df_interp_loglinear(.x, nodes))
+  spots <- dfs^(-1/years) - 1
+  tibble(Tenor = years, Spot = spots)
+}
+```
+
+## Question 4(a)
+```{r}
+tenors_1to5 <- 1:5
+
+ytm_1to5 <- curves %>%
+  group_by(Date) %>%
+  group_modify(~{
+    yy <- approx(.x$T_years, .x$YTM, xout = tenors_1to5, rule = 2)$y
+    tibble(Tenor = tenors_1to5, YTM = yy)
+  }) %>%
+  ungroup()
+
+ggplot(ytm_1to5, aes(x = Tenor, y = YTM, colour = Date, group = Date)) +
+  geom_line() +
+  geom_point(size = 1) +
+  labs(
+    x = "Tenor (years)",
+    y = "Yield to maturity (decimal)",
+    title = "1–5Y Government of Canada yield curves (YTM)",
+    colour = "Date"
+  ) +
+  theme_minimal()
+```
+
+## Question 4(b)
+```{r}
+
+library(tidyverse)
+library(lubridate)
+library(stringr)
+library(scales)
+
+F <- 100
+prices <- read.csv("Prices_10bonds.csv", check.names = FALSE, stringsAsFactors = FALSE)
+
+pct_to_dec <- function(x){
+  x <- as.character(x)
+  x <- str_replace_all(x, "\\s+", "")
+  x <- str_replace(x, "%", "")
+  as.numeric(x)/100
+}
+
+to_date_any <- function(x){
+  x <- as.character(x)
+  d1 <- suppressWarnings(ymd(x, quiet = TRUE))
+  d2 <- suppressWarnings(mdy(x, quiet = TRUE))
+  as.Date(coalesce(d1, d2))
+}
+date_cols <- names(prices)[str_detect(names(prices), "^\\d{4}-\\d{2}-\\d{2}$")]
+date_cols <- sort(date_cols)
+date_cols <- head(date_cols, 10)
+bonds_static <- prices %>%
+  transmute(
+    ISIN     = ISIN,
+    coupon   = pct_to_dec(Coupon),
+    maturity = to_date_any(Maturity)
+  )
+
+yearfrac_365 <- function(settle, d){
+  settle <- as.Date(settle)
+  d      <- as.Date(d)
+  as.numeric(d - settle) / 365
+}
+
+coupon_schedule <- function(settle, maturity){
+  settle   <- as.Date(settle)
+  maturity <- as.Date(maturity)
+
+  dd <- maturity
+  out <- c()
+  while(dd > settle){
+    out <- c(out, dd)
+    dd  <- dd %m-% months(6)
+  }
+  sort(as.Date(out))
+}
+
+last_coupon_date <- function(settle, maturity){
+  settle   <- as.Date(settle)
+  maturity <- as.Date(maturity)
+
+  dd <- maturity
+  while(dd > settle){
+    dd <- dd %m-% months(6)
+  }
+  as.Date(dd)
+}
+
+accrued_interest <- function(coupon_rate, settle, maturity, F = 100){
+  settle   <- as.Date(settle)
+  maturity <- as.Date(maturity)
+
+  last_coupon <- last_coupon_date(settle, maturity)
+  next_coupon <- as.Date(last_coupon %m+% months(6))  # DO NOT name this variable `next`
+
+  days_since  <- as.numeric(settle - last_coupon)
+  days_period <- as.numeric(next_coupon - last_coupon)
+
+  coupon_pay <- coupon_rate * F / 2
+  coupon_pay * (days_since / days_period)
+}
+df_at_time <- function(t, nodes){
+  t <- as.numeric(t)
+  tt <- nodes$time
+  df <- nodes$df
+
+  t_min <- min(tt); df_min <- df[which.min(tt)]
+  t_max <- max(tt); df_max <- df[which.max(tt)]
+
+  if(t <= t_min){
+    y0 <- -log(df_min) / t_min
+    return(exp(-y0 * t))
+  }
+
+  if(t >= t_max){
+    r_last <- df_max^(-1 / t_max) - 1
+    return((1 + r_last)^(-t))
+  }
+
+  exp(approx(tt, log(df), xout = t, rule = 1)$y)
+}
+
+bootstrap_discount_nodes <- function(settle, bond_day){
+  settle <- as.Date(settle)
+
+  bd <- bond_day %>%
+    mutate(
+      maturity = as.Date(maturity),
+      clean    = as.numeric(clean)
+    ) %>%
+    filter(!is.na(maturity), !is.na(clean), maturity > settle) %>%
+    mutate(
+      tM    = map_dbl(maturity, ~yearfrac_365(settle, .x)),
+      dirty = clean + map2_dbl(coupon, maturity, ~accrued_interest(.x, settle, .y, F = F))
+    ) %>%
+    arrange(tM)
+
+  nodes <- tibble(time = numeric(0), df = numeric(0))
+
+  for(i in seq_len(nrow(bd))){
+    cpn <- bd$coupon[i]
+    mat <- bd$maturity[i]
+    P   <- bd$dirty[i]
+
+    c_dates <- coupon_schedule(settle, mat)
+    times   <- map_dbl(c_dates, ~yearfrac_365(settle, .x))
+    tM      <- times[length(times)]
+
+    C   <- F * cpn/2
+    cfs <- rep(C, length(times))
+    cfs[length(cfs)] <- cfs[length(cfs)] + F
+    price_given_dfM <- function(dfM){
+      total <- 0
+
+      if(nrow(nodes) == 0){
+
+        for(k in seq_along(times)){
+          tk  <- times[k]
+          dfk <- dfM^(tk / tM)
+          total <- total + cfs[k]*dfk
+        }
+        return(total)
+      }
+
+      t_last  <- max(nodes$time)
+      df_last <- nodes$df[which.max(nodes$time)]
+
+      for(k in seq_along(times)){
+        tk <- times[k]
+        dfk <- if(tk <= t_last){
+          df_at_time(tk, nodes)
+        } else if(tk < tM){
+          w <- (tk - t_last) / (tM - t_last)
+          exp((1-w)*log(df_last) + w*log(dfM))
+        } else {
+          dfM
+        }
+        total <- total + cfs[k]*dfk
+      }
+      total
+    }
+
+    f_root <- function(dfM) price_given_dfM(dfM) - P
+
+    lo <- 1e-12
+    hi <- 2
+    flo <- f_root(lo)
+    fhi <- f_root(hi)
+    it  <- 0
+    while(flo*fhi > 0 && it < 40){
+      hi <- hi*2
+      fhi <- f_root(hi)
+      it <- it + 1
+    }
+    if(flo*fhi > 0){
+      stop("Cannot bracket DF root on ", as.character(settle), " for ISIN ", bd$ISIN[i])
+    }
+
+    dfM <- uniroot(f_root, interval = c(lo, hi), tol = 1e-12)$root
+    nodes <- bind_rows(nodes, tibble(time = tM, df = dfM)) %>% arrange(time)
+  }
+
+  nodes
+}
+
+spot_at_years <- function(nodes, years = 1:5){
+  tibble(
+    Tenor = years,
+    Spot  = map_dbl(years, ~ df_at_time(.x, nodes)^(-1/.x) - 1)
+  )
+}
+
+spot_curves_long <- map_dfr(date_cols, function(dc){
+  settle <- as.Date(dc)
+
+  bond_day <- bonds_static %>%
+    mutate(clean = as.numeric(prices[[dc]]))
+
+  nodes <- bootstrap_discount_nodes(settle, bond_day)
+
+  spot_at_years(nodes, years = 1:5) %>%
+    mutate(Date = settle) %>%
+    select(Date, Tenor, Spot)
+})
+
+ggplot(spot_curves_long, aes(x = Tenor, y = Spot, group = Date, color = Date)) +
+  geom_line(linewidth = 0.7, alpha = 0.85) +
+  geom_point(size = 1) +
+  scale_x_continuous(breaks = 1:5) +
+  scale_y_continuous(labels = percent_format(accuracy = 0.01)) +
+  labs(
+    title = "Bootstrapped 1–5Y Spot Curves (Daily)",
+    x = "Tenor (years)",
+    y = "Spot rate (annual, effective)",
+    color = "Date"
+  ) +
+  theme_minimal()
+```
+
+## Question 4(c)
+```{r}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+spot_wide <- spot_curves_long %>%
+  mutate(Date = as.Date(Date), Tenor = as.integer(Tenor)) %>%
+  filter(Tenor %in% 1:5) %>%
+  select(Date, Tenor, Spot) %>%
+  pivot_wider(names_from = Tenor, values_from = Spot, names_prefix = "S") %>%
+  arrange(Date)
+need_cols <- paste0("S", 1:5)
+if (!all(need_cols %in% names(spot_wide))) {
+  stop("spot_wide is missing some of S1..S5. Existing columns: ",
+       paste(names(spot_wide), collapse = ", "))
+}
+if (anyNA(spot_wide[, need_cols])) {
+  bad <- spot_wide %>% filter(if_any(all_of(need_cols), is.na))
+  stop("NA spot rates found in S1..S5 for some dates:\n",
+       paste(capture.output(print(bad)), collapse = "\n"))
+}
+forward_1y <- spot_wide %>%
+  mutate(
+    f_1y1y = ((1 + S2)^2 / (1 + S1))^(1/1) - 1,
+    f_1y2y = ((1 + S3)^3 / (1 + S1))^(1/2) - 1,
+    f_1y3y = ((1 + S4)^4 / (1 + S1))^(1/3) - 1,
+    f_1y4y = ((1 + S5)^5 / (1 + S1))^(1/4) - 1
+  ) %>%
+  select(Date, f_1y1y, f_1y2y, f_1y3y, f_1y4y) %>%
+  pivot_longer(-Date, names_to = "Forward", values_to = "Fwd") %>%
+  mutate(
+    Horizon = recode(Forward,
+                     "f_1y1y" = 2L,
+                     "f_1y2y" = 3L,
+                     "f_1y3y" = 4L,
+                     "f_1y4y" = 5L)
+  )
+
+stopifnot(!anyNA(forward_1y$Fwd))
+ggplot(forward_1y, aes(x = Horizon, y = Fwd, colour = Date, group = Date)) +
+  geom_line() +
+  geom_point(size = 1) +
+  labs(
+    x = "Forward maturity (end year)",
+    y = "1-year forward rate (annual effective, decimal)",
+    title = "1-year forward curves implied by spot rates (start at year 1)",
+    colour = "Date"
+  ) +
+  theme_minimal()
+summary(forward_1y$Fwd)
+```
+
+## Question 5
+```{r}
+library(dplyr)
+library(tidyr)
+library(stringr)
+date_cols_all <- names(prices)[str_detect(names(prices), "^\\d{4}-\\d{2}-\\d{2}$")] %>% sort()
+days_all <- as.Date(date_cols_all)
+days_all <- days_all[days_all >= as.Date("2026-01-05") & days_all <= as.Date("2026-01-19")]
+
+if (length(days_all) < 10) stop("Need at least 10 trading days in Prices_10bonds.csv within 2026-01-05..2026-01-19.")
+if (length(days_all) > 10) message("More than 10 days found; using the first 10 chronologically to match '10 days / 9 returns' requirement.")
+
+days10 <- head(days_all, 10)
+ytm_use <- ytm_1to5 %>%
+  mutate(Date = as.Date(Date), Tenor = as.integer(Tenor)) %>%
+  filter(Date %in% days10, Tenor %in% 1:5) %>%
+  group_by(Date, Tenor) %>%
+  summarise(YTM = mean(YTM, na.rm = TRUE), .groups = "drop") %>%
+  complete(Date = days10, Tenor = 1:5) %>%
+  arrange(Date, Tenor)
+
+if (anyNA(ytm_use$YTM)) {
+  miss <- ytm_use %>% filter(is.na(YTM))
+  stop("Missing YTM(s) for some Date/Tenor:\n", paste(capture.output(print(miss)), collapse="\n"))
+}
+
+ytm_wide <- ytm_use %>%
+  pivot_wider(names_from = Tenor, values_from = YTM, names_prefix = "y") %>%
+  arrange(Date)
+
+Y <- as.matrix(ytm_wide %>% select(y1, y2, y3, y4, y5))
+stopifnot(nrow(Y) == 10, ncol(Y) == 5)
+
+Y_logret <- log(Y[-1, , drop = FALSE] / Y[-nrow(Y), , drop = FALSE])
+cov_yields <- cov(Y_logret)
+cov_yields
+fwd_levels <- c("f_1y1y","f_1y2y","f_1y3y","f_1y4y")
+
+fwd_use <- forward_1y %>%
+  mutate(Date = as.Date(Date), Forward = as.character(Forward)) %>%
+  filter(Date %in% days10, Forward %in% fwd_levels) %>%
+  group_by(Date, Forward) %>%
+  summarise(Fwd = mean(Fwd, na.rm = TRUE), .groups = "drop") %>%
+  complete(Date = days10, Forward = fwd_levels) %>%
+  arrange(Date, Forward)
+
+if (anyNA(fwd_use$Fwd)) {
+  miss <- fwd_use %>% filter(is.na(Fwd))
+  stop("Missing forward(s) for some Date/Forward:\n", paste(capture.output(print(miss)), collapse="\n"))
+}
+
+fwd_wide <- fwd_use %>%
+  pivot_wider(names_from = Forward, values_from = Fwd) %>%
+  arrange(Date)
+
+Fmat <- as.matrix(fwd_wide %>% select(all_of(fwd_levels)))
+stopifnot(nrow(Fmat) == 10, ncol(Fmat) == 4)
+
+F_logret <- log(Fmat[-1, , drop = FALSE] / Fmat[-nrow(Fmat), , drop = FALSE])
+cov_forwards <- cov(F_logret)
+cov_forwards
+```
+
+## Question 6
+```{r}
+eig_yields   <- eigen(cov_yields)
+eig_forwards <- eigen(cov_forwards)
+
+eig_yields$values
+eig_yields$vectors
+
+eig_forwards$values
+eig_forwards$vectors
+eig_yields$values / sum(eig_yields$values)
+eig_forwards$values / sum(eig_forwards$values)
+```
